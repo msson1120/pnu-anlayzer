@@ -298,7 +298,12 @@ async def run_once(
 ) -> pd.DataFrame:
     sem = asyncio.Semaphore(concurrency)
 
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Connection": "close"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Connection": "close",
+        "Referer": "https://pnu-analyzer-bafef8mwydilfpbwvzvhng.streamlit.app/",
+    }
     timeout = aiohttp.ClientTimeout(total=None)
     connector = aiohttp.TCPConnector(
         limit=concurrency,
@@ -402,8 +407,8 @@ RESULT_COLS = [
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="VWorld PNU 조회기", layout="wide")
-st.title("VWorld PNU → 공부상면적(㎡) 조회기 (Streamlit)")
+st.set_page_config(page_title="KH-Urban PNU 기반 분석기", layout="wide")
+st.title("KH-Urban PNU 기반 분석기")
 
 with st.sidebar:
     st.subheader("설정")
