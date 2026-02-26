@@ -1,20 +1,9 @@
-# app.py
-# ---------------------------------------------------------
-# Streamlit 버전: VWorld PNU → 공부상면적(㎡) 조회기
-# - 입력: 엑셀 업로드 (pnu 컬럼 필요)
-# - 처리: PNU 정규화(19자리), (옵션) 중복 제거, VWorld 비동기 조회 + 재시도
-# - 출력: 결과 엑셀 다운로드
-#
-# 실행:
-#   pip install streamlit pandas openpyxl aiohttp
-#   streamlit run app.py
-# ---------------------------------------------------------
-
 import asyncio
+import io
+import json
 import random
 import time
-from io import BytesIO
-from typing import Any, Optional, Tuple, List, Callable, Dict
+from typing import Any, Optional, Tuple, List, Callable
 
 import pandas as pd
 import aiohttp
@@ -25,7 +14,7 @@ API_URL = "https://api.vworld.kr/ned/data/ladfrlList"  # VWorld API 128
 
 
 # =========================
-# Core parsing helpers
+# Core logic (VWorld)  ✅ 원본 로직 유지
 # =========================
 def _find_first_key(obj: Any, key: str) -> Optional[Any]:
     if isinstance(obj, dict):
@@ -46,46 +35,29 @@ def _find_first_key(obj: Any, key: str) -> Optional[Any]:
 def _get_first_record(data: Any) -> Optional[dict]:
     """
     VWorld ladfrlList 응답에서 실제 1건 레코드(dict)를 찾아 반환
+    (구조가 ladfrlVOList 안에 ladfrlVOList가 또 있는 형태가 많음)
     """
-    if not isinstance(data, (dict, list)):
-        return None
+    try:
+        a = data.get("ladfrlVOList")
+        if isinstance(a, dict):
+            b = a.get("ladfrlVOList")
+            if isinstance(b, list) and b and isinstance(b[0], dict):
+                return b[0]
+        if isinstance(a, list) and a and isinstance(a[0], dict):
+            return a[0]
+    except Exception:
+        pass
 
-    # 보통 result/items/item 또는 ladfrlList/items/item 형태가 많음
-    # 안전하게 dict/list를 모두 훑어서 dict 형태(레코드 후보)를 찾는다.
-    if isinstance(data, dict):
-        # 가장 흔한 경로들
-        for path in [
-            ("result", "items", "item"),
-            ("ladfrlList", "items", "item"),
-            ("response", "result", "items", "item"),
-            ("response", "ladfrlList", "items", "item"),
-        ]:
-            cur = data
-            ok = True
-            for k in path:
-                if isinstance(cur, dict) and k in cur:
-                    cur = cur[k]
-                else:
-                    ok = False
-                    break
-            if ok:
-                if isinstance(cur, list) and cur:
-                    return cur[0] if isinstance(cur[0], dict) else None
-                if isinstance(cur, dict):
-                    return cur
-
-    # fallback: 아무 dict 하나라도 레코드처럼 보이면 반환
-    # (하지만 너무 깊게 가면 엉뚱한 dict가 잡힐 수 있어 "area 필드"가 있는 dict를 우선)
     def walk(x: Any) -> Optional[dict]:
         if isinstance(x, dict):
-            if "lndpclAr" in x or "ldCodeNm" in x or "lnbrMnnm" in x:
-                return x
             for v in x.values():
                 r = walk(v)
                 if r is not None:
                     return r
         elif isinstance(x, list):
             for it in x:
+                if isinstance(it, dict):
+                    return it
                 r = walk(it)
                 if r is not None:
                     return r
@@ -94,12 +66,20 @@ def _get_first_record(data: Any) -> Optional[dict]:
     return walk(data)
 
 
-def _pick(rec: Optional[dict], *keys: str, default: Any = "") -> Any:
-    if not isinstance(rec, dict):
+def _pick(d: Optional[dict], *keys: str, default="") -> Any:
+    """레코드 dict에서 keys 후보 중 첫 유효 값을 반환"""
+    if not isinstance(d, dict):
         return default
     for k in keys:
-        if k in rec and rec[k] is not None:
-            return rec[k]
+        v = d.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            # 공백 문자열은 무효로 보되, "0"은 유효값이므로 유지
+            if v.strip() == "":
+                continue
+            return v.strip()
+        return v
     return default
 
 
@@ -107,33 +87,39 @@ def _to_int_str(x: Any) -> str:
     if x is None:
         return ""
     s = str(x).strip()
-    if s == "" or s.lower() == "nan":
+    if s == "":
         return ""
-    try:
-        return str(int(float(s)))
-    except Exception:
-        # 숫자 변환 실패면 원문 유지
-        return s
+    if s.isdigit():
+        return str(int(s))
+    return s
 
 
 def _pnu_to_jibun(pnu: str) -> str:
     """
-    PNU(19자리)에서 지번 추정:
-    - 마지막 8자리 = 본번(4) + 부번(4)
+    PNU(19자리)로 지번 복원:
+    - pnu[10] : 산 여부(1이면 산)
+    - pnu[11:15] : 본번(4자리)
+    - pnu[15:19] : 부번(4자리)
     """
     pnu = (pnu or "").strip()
     if len(pnu) != 19 or not pnu.isdigit():
         return ""
-    main_no = int(pnu[-8:-4])
-    sub_no = int(pnu[-4:])
-    if sub_no == 0:
-        return str(main_no)
-    return f"{main_no}-{sub_no}"
+
+    is_mountain = (pnu[10] == "0")  # 0이면 산, 1이면 일반
+    mnnm = int(pnu[11:15])
+    slno = int(pnu[15:19])
+
+    if slno == 0:
+        base = f"{mnnm}"
+    else:
+        base = f"{mnnm}-{slno}"
+
+    # 산 표기 포함
+    if is_mountain:
+        return f"산{base}"
+    return base
 
 
-# =========================
-# PNU normalize
-# =========================
 def normalize_pnu_series(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.strip()
     s = s.str.replace(r"\s+", "", regex=True)
@@ -154,9 +140,6 @@ def normalize_pnu_series(s: pd.Series) -> pd.Series:
     return s.map(fix_one)
 
 
-# =========================
-# Async fetch
-# =========================
 async def fetch_one(
     session: aiohttp.ClientSession,
     pnu: str,
@@ -231,7 +214,7 @@ async def fetch_one(
                     lndcgr_code_nm = _pick(rec, "lndcgrCodeNm", "lndcgrNm", "jimok", default="")
                     posesn_se_nm = _pick(rec, "posesnSeCodeNm", "posesnSeNm", "posesnSe", default="")
 
-                    # 소유(공유)인수
+                    # 소유(공유)인수 → 표시 문자열로 변환
                     raw_cnt = _pick(
                         rec,
                         "cnrsPsnCo",
@@ -242,8 +225,20 @@ async def fetch_one(
                         "co",
                         "count",
                         "ownCnt",
-                        default=None,
+                        default=None
                     )
+
+                    if raw_cnt is None and isinstance(rec, dict):
+                        for k in rec.keys():
+                            k_lower = k.lower()
+                            if any(word in k_lower for word in ["co", "cnt", "count", "인수", "소유", "prtn", "psn"]):
+                                try:
+                                    val = rec[k]
+                                    if val is not None and str(val).strip():
+                                        raw_cnt = val
+                                        break
+                                except Exception:
+                                    continue
 
                     posesn_cnt_text = ""
                     if raw_cnt is not None:
@@ -280,8 +275,12 @@ async def fetch_one(
 
             except asyncio.TimeoutError:
                 last_err = "timeout"
+            except aiohttp.ClientError as e:
+                last_err = f"client_error: {e}"
+            except json.JSONDecodeError:
+                last_err = "json_decode_error"
             except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
+                last_err = f"unknown_error: {type(e).__name__}: {e}"
 
             if attempt < max_retries:
                 await asyncio.sleep(min(backoff, 20) + random.uniform(0, 0.6))
@@ -298,42 +297,28 @@ async def run_once(
 ) -> pd.DataFrame:
     sem = asyncio.Semaphore(concurrency)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "Connection": "close",
-        "Referer": "https://pnu-analyzer-bafef8mwydilfpbwvzvhng.streamlit.app/",
-    }
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Connection": "close"}
     timeout = aiohttp.ClientTimeout(total=None)
     connector = aiohttp.TCPConnector(
         limit=concurrency,
         limit_per_host=concurrency,
-        force_close=True,          # 핵심: keep-alive 끔
+        ttl_dns_cache=300,
+        keepalive_timeout=5,
         enable_cleanup_closed=True,
     )
 
-    results: List[Optional[Tuple]] = [None] * len(pnu_list)
-
     async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        tasks = [fetch_one(session, pnu, key, sem) for pnu in pnu_list]
+
+        total = len(tasks)
         t0 = time.time()
-        total = len(pnu_list)
 
-        async def one(i: int, p: str):
-            await asyncio.sleep(random.uniform(0.0, 0.3))
-            r = await fetch_one(session, p, key, sem)
-            return i, r
+        results = await asyncio.gather(*tasks)
 
-        tasks = [asyncio.create_task(one(i, p)) for i, p in enumerate(pnu_list)]
-
-        done_count = 0
-        for fut in asyncio.as_completed(tasks):
-            i, r = await fut
-            results[i] = r
-            done_count += 1
-            if progress_cb:
-                dt = max(time.time() - t0, 1e-6)
-                rate = done_count / dt
-                progress_cb(done_count, total, rate)
+        if progress_cb:
+            dt = max(time.time() - t0, 1e-6)
+            rate = total / dt
+            progress_cb(total, total, rate)
 
     return pd.DataFrame(
         results,
@@ -375,7 +360,7 @@ async def run_batch_with_retry(
 
     out2 = await run_once(fail, key, conc2, None)
 
-    out2_map: Dict[str, pd.Series] = {r["PNU"]: r for _, r in out2.iterrows()}
+    out2_map = {r["PNU"]: r for _, r in out2.iterrows()}
     merged_rows = []
     recovered = 0
     for _, r in out1.iterrows():
@@ -391,179 +376,111 @@ async def run_batch_with_retry(
     return pd.DataFrame(merged_rows)
 
 
-RESULT_COLS = [
-    "공부상면적(㎡)",
-    "법정동명",
-    "지번",
-    "대장구분명",
-    "지목명",
-    "소유구분명",
-    "상태",
-    "소유(공유)인수",
-    "데이터기준일자",
-]
-
-
 # =========================
-# Streamlit UI
+# Streamlit UI  ✅ GUI만 교체
 # =========================
-st.set_page_config(page_title="KH-Urban PNU 기반 분석기", layout="wide")
-st.title("KH-Urban PNU 기반 분석기")
+st.set_page_config(page_title="VWorld PNU → 공부상면적(㎡) 조회기", layout="wide")
+st.title("VWorld PNU → 공부상면적(㎡) 조회기 (Streamlit)")
 
 with st.sidebar:
-    st.subheader("설정")
-    api_key = st.text_input("VWorld API Key", type="password", placeholder="키를 입력하세요")
-    concurrency = st.number_input("동시 요청 수", min_value=1, max_value=100, value=15, step=1)
-    dedup = st.checkbox("중복 PNU 제거", value=True)
-    st.caption("입력 엑셀에 'pnu' 컬럼이 있어야 합니다.")
+    st.header("설정")
+    api_key = st.text_input("VWorld API Key", type="password")
+    concurrency = st.number_input("동시요청(Concurrency)", min_value=1, max_value=60, value=15, step=1)
+    dedup = st.checkbox("중복 PNU 제거(dedup)", value=True)
 
-uploaded = st.file_uploader("입력 엑셀 업로드 (.xlsx)", type=["xlsx"])
-
-log_box = st.empty()
-progress_bar = st.progress(0)
-status_line = st.empty()
+uploaded = st.file_uploader("입력 엑셀(.xlsx) 업로드 (pnu 컬럼 필요)", type=["xlsx"])
 
 if "logs" not in st.session_state:
-    st.session_state.logs = []
+    st.session_state["logs"] = []
 
+log_placeholder = st.empty()
+prog = st.progress(0)
+status = st.empty()
 
-def add_log(msg: str):
-    st.session_state.logs.append(msg)
-    # 너무 길어지면 최근 300줄만 유지
-    if len(st.session_state.logs) > 300:
-        st.session_state.logs = st.session_state.logs[-300:]
-    log_box.text("\n".join(st.session_state.logs))
+def log(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    st.session_state["logs"].append(f"[{ts}] {msg}")
+    # 너무 길어지면 최근 300줄만 표시
+    log_placeholder.text("\n".join(st.session_state["logs"][-300:]))
 
+def progress_cb(done: int, total: int, rate: float):
+    total = max(total, 1)
+    frac = min(max(done / total, 0.0), 1.0)
+    prog.progress(frac)
+    status.info(f"{done}/{total} | {rate:.2f} req/s")
 
-def set_progress(done: int, total: int, rate: float):
-    if total <= 0:
-        progress_bar.progress(0)
-        return
-    pct = int(done / total * 100)
-    progress_bar.progress(min(max(pct, 0), 100))
-    status_line.text(f"진행: {done}/{total}  |  속도: {rate:.2f} 건/초")
+run_btn = st.button("실행", type="primary", disabled=(uploaded is None or not api_key))
 
-
-run = st.button("실행", type="primary", disabled=(uploaded is None or not api_key))
-
-if run:
-    st.session_state.logs = []
-    add_log("[시작] 실행 버튼 클릭")
-
+if run_btn:
     try:
-        # 1) 엑셀 읽기
-        df_in = pd.read_excel(uploaded)
+        st.session_state["logs"] = []
+        log("실행 시작")
 
-        # 'pnu' 컬럼 체크(대소문자 대비)
-        cols_lower = {c.lower(): c for c in df_in.columns}
-        if "pnu" not in cols_lower:
-            raise RuntimeError("엑셀에 'pnu' 컬럼이 없습니다. (컬럼명: pnu)")
+        df = pd.read_excel(uploaded)
+        if "pnu" not in df.columns:
+            raise RuntimeError("엑셀에 'pnu' 컬럼이 없습니다.")
 
-        pnu_col = cols_lower["pnu"]
+        df["pnu"] = normalize_pnu_series(df["pnu"])
 
-        # 원본 순서 보존용
-        df_in = df_in.reset_index(drop=False).rename(columns={"index": "_rowid"})
+        valid_mask = df["pnu"].astype(str).str.fullmatch(r"\d{19}")
+        valid = df.loc[valid_mask, "pnu"].astype(str).tolist()
+        invalid = df.loc[~valid_mask, "pnu"].astype(str).tolist()
 
-        # PNU 컬럼 정규화
-        df_in[pnu_col] = normalize_pnu_series(df_in[pnu_col])
-
-        # 유효성 마스크
-        valid_mask = df_in[pnu_col].astype(str).str.fullmatch(r"\d{19}")
-        valid_in_order = df_in.loc[valid_mask, pnu_col].astype(str).tolist()
-        invalid_in_order = df_in.loc[~valid_mask, pnu_col].astype(str).tolist()
-
-        add_log(f"원본 행수: {len(df_in)} / 유효 PNU: {len(valid_in_order)} / INVALID: {len(invalid_in_order)}")
-
-        # 조회 대상 리스트(중복 제거 옵션은 '조회'에만 적용)
         if dedup:
-            before = len(valid_in_order)
-            unique_valid = list(dict.fromkeys(valid_in_order))  # 등장 순서 유지 중복 제거
-            add_log(f"조회 중복 제거: {before} → {len(unique_valid)}")
-        else:
-            unique_valid = valid_in_order
+            before = len(valid)
+            valid = list(dict.fromkeys(valid))
+            log(f"중복 제거: {before} → {len(valid)}")
 
-        if not unique_valid:
+        log(f"유효 PNU: {len(valid)}건 / INVALID: {len(invalid)}건")
+        if not valid:
             raise RuntimeError("유효한 19자리 PNU가 없습니다.")
 
-        progress_bar.progress(0)
-        status_line.text("조회 준비중...")
-
-        # 1) 유효 PNU만 조회
         out_valid = asyncio.run(
             run_batch_with_retry(
-                unique_valid,
+                valid,
                 api_key,
                 int(concurrency),
-                progress_cb=set_progress,
-                log_cb=add_log,
+                progress_cb=progress_cb,
+                log_cb=log,
             )
         )
 
-        # 2) 결과를 PNU → 결과 row(dict) 맵으로 변환
-        res_map = out_valid.set_index("PNU")[RESULT_COLS].to_dict(orient="index")
+        if invalid:
+            out_invalid = pd.DataFrame(
+                [(p, None, "", "", "", "", "", "INVALID_PNU", "", "PNU must be 19-digit numeric") for p in invalid],
+                columns=[
+                    "PNU",
+                    "공부상면적(㎡)",
+                    "법정동명",
+                    "지번",
+                    "대장구분명",
+                    "지목명",
+                    "소유구분명",
+                    "상태",
+                    "소유(공유)인수",
+                    "데이터기준일자",
+                ],
+            )
+            out_all = pd.concat([out_valid, out_invalid], ignore_index=True)
+        else:
+            out_all = out_valid
 
-        # 3) 원본 df_in에 결과 컬럼 붙이기 (원본 순서/행수 그대로)
-        def attach_result(pnu: str) -> dict:
-            pnu = str(pnu).strip()
-            if not (len(pnu) == 19 and pnu.isdigit()):
-                return {
-                    "공부상면적(㎡)": None,
-                    "법정동명": "",
-                    "지번": "",
-                    "대장구분명": "",
-                    "지목명": "",
-                    "소유구분명": "",
-                    "상태": "INVALID_PNU",
-                    "소유(공유)인수": "",
-                    "데이터기준일자": "PNU must be 19-digit numeric",
-                }
-            if pnu in res_map:
-                return res_map[pnu]
-            # 이 케이스는 거의 없지만 안전망(예: 예외로 누락)
-            return {
-                "공부상면적(㎡)": None,
-                "법정동명": "",
-                "지번": _pnu_to_jibun(pnu),
-                "대장구분명": "",
-                "지목명": "",
-                "소유구분명": "",
-                "상태": "NO_DATA",
-                "소유(공유)인수": "",
-                "데이터기준일자": "missing in result map",
-            }
-
-        attached = df_in[pnu_col].map(attach_result).apply(pd.Series)
-        df_out = pd.concat([df_in, attached], axis=1)
-
-        # 4) 원본 인덱스 기준으로 정렬(=원본 순서), _rowid 제거
-        df_out = df_out.sort_values("_rowid").drop(columns=["_rowid"]).reset_index(drop=True)
-
-        add_log("[완료] 원본 순서 유지 상태로 결과 결합 완료")
-
-        # 이후 다운로드/미리보기는 out_all 대신 df_out 사용
-        out_all = df_out
-
-        add_log("[완료] 결과 데이터 생성 완료")
-        progress_bar.progress(100)
-        status_line.text("완료")
-
-        # 4) 다운로드 제공
-        buf = BytesIO()
-        out_all.to_excel(buf, index=False)
+        log("결과 엑셀 생성")
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            out_all.to_excel(writer, index=False, sheet_name="result")
         buf.seek(0)
 
-        st.success("완료: 결과 엑셀을 다운로드하세요.")
+        st.success("완료")
+        st.dataframe(out_all, use_container_width=True)
+
         st.download_button(
-            label="결과 엑셀 다운로드",
+            "결과 엑셀 다운로드",
             data=buf,
             file_name="vworld_pnu_result.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # (옵션) 화면에 미리보기
-        st.subheader("결과 미리보기")
-        st.dataframe(out_all, use_container_width=True)
-
     except Exception as e:
-        add_log(f"[오류] {type(e).__name__}: {e}")
         st.error(f"{type(e).__name__}: {e}")
+        log(f"오류: {type(e).__name__}: {e}")
