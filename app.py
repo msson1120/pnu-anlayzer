@@ -3,6 +3,7 @@ import io
 import json
 import random
 import socket
+import threading
 import time
 from typing import Any, Optional, Tuple, List, Callable
 
@@ -357,7 +358,7 @@ async def run_batch_with_retry(
             log_cb("[완료] 1차에서 모두 처리됨")
         return out1
 
-    conc2 = max(5, concurrency // 2)
+    conc2 = max(3, concurrency // 2)
     if log_cb:
         log_cb(f"[2차] 1차 실패 {len(fail)}건 → 재시도(동시 {conc2})")
 
@@ -388,13 +389,19 @@ st.title("VWorld PNU → 공부상면적(㎡) 조회기 (Streamlit)")
 with st.sidebar:
     st.header("설정")
     api_key = st.text_input("VWorld API Key", type="password")
-    concurrency = st.number_input("동시요청(Concurrency)", min_value=1, max_value=60, value=15, step=1)
+    concurrency = st.number_input("동시요청(Concurrency)", min_value=1, max_value=60, value=8, step=1)
     dedup = st.checkbox("중복 PNU 제거(dedup)", value=True)
 
 uploaded = st.file_uploader("입력 엑셀(.xlsx) 업로드 (pnu 컬럼 필요)", type=["xlsx"])
 
 if "logs" not in st.session_state:
     st.session_state["logs"] = []
+
+if "running" not in st.session_state:
+    st.session_state["running"] = False
+
+if "result_df" not in st.session_state:
+    st.session_state["result_df"] = None
 
 log_placeholder = st.empty()
 prog = st.progress(0)
@@ -414,7 +421,7 @@ def progress_cb(done: int, total: int, rate: float):
 
 run_btn = st.button("실행", type="primary", disabled=(uploaded is None or not api_key))
 
-if run_btn:
+if run_btn and not st.session_state["running"]:
     try:
         st.session_state["logs"] = []
         log("실행 시작")
@@ -438,52 +445,72 @@ if run_btn:
         if not valid:
             raise RuntimeError("유효한 19자리 PNU가 없습니다.")
 
-        out_valid = asyncio.run(
-            run_batch_with_retry(
-                valid,
-                api_key,
-                int(concurrency),
-                progress_cb=progress_cb,
-                log_cb=log,
-            )
+        st.session_state["running"] = True
+
+        def run_job(valid, invalid, api_key, concurrency):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            try:
+                out_valid = loop.run_until_complete(
+                    run_batch_with_retry(
+                        valid,
+                        api_key,
+                        concurrency,
+                        progress_cb=progress_cb,
+                        log_cb=log,
+                    )
+                )
+
+                if invalid:
+                    out_invalid = pd.DataFrame(
+                        [(p, None, "", "", "", "", "", "INVALID_PNU", "", "PNU must be 19-digit numeric") for p in invalid],
+                        columns=[
+                            "PNU",
+                            "공부상면적(㎡)",
+                            "법정동명",
+                            "지번",
+                            "대장구분명",
+                            "지목명",
+                            "소유구분명",
+                            "상태",
+                            "소유(공유)인수",
+                            "데이터기준일자",
+                        ],
+                    )
+                    out_all = pd.concat([out_valid, out_invalid], ignore_index=True)
+                else:
+                    out_all = out_valid
+
+                st.session_state["result_df"] = out_all
+
+            finally:
+                loop.close()
+                st.session_state["running"] = False
+
+        thread = threading.Thread(
+            target=run_job,
+            args=(valid, invalid, api_key, int(concurrency)),
+            daemon=True,
         )
-
-        if invalid:
-            out_invalid = pd.DataFrame(
-                [(p, None, "", "", "", "", "", "INVALID_PNU", "", "PNU must be 19-digit numeric") for p in invalid],
-                columns=[
-                    "PNU",
-                    "공부상면적(㎡)",
-                    "법정동명",
-                    "지번",
-                    "대장구분명",
-                    "지목명",
-                    "소유구분명",
-                    "상태",
-                    "소유(공유)인수",
-                    "데이터기준일자",
-                ],
-            )
-            out_all = pd.concat([out_valid, out_invalid], ignore_index=True)
-        else:
-            out_all = out_valid
-
-        log("결과 엑셀 생성")
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            out_all.to_excel(writer, index=False, sheet_name="result")
-        buf.seek(0)
-
-        st.success("완료")
-        st.dataframe(out_all, use_container_width=True)
-
-        st.download_button(
-            "결과 엑셀 다운로드",
-            data=buf,
-            file_name="vworld_pnu_result.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        thread.start()
 
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
         log(f"오류: {type(e).__name__}: {e}")
+
+if st.session_state["result_df"] is not None:
+    st.success("완료")
+    st.dataframe(st.session_state["result_df"], use_container_width=True)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        st.session_state["result_df"].to_excel(writer, index=False)
+    buf.seek(0)
+
+    st.download_button(
+        "결과 엑셀 다운로드",
+        data=buf,
+        file_name="vworld_pnu_result.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
