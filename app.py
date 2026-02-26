@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import random
+import socket
 import time
 from typing import Any, Optional, Tuple, List, Callable
 
@@ -163,6 +164,7 @@ async def fetch_one(
         last_err = ""
         for attempt in range(1, max_retries + 1):
             try:
+                await asyncio.sleep(random.uniform(0.05, 0.25))
                 async with session.get(API_URL, params=params, timeout=timeout_sec) as resp:
                     if resp.status in (429, 500, 502, 503, 504):
                         txt = await resp.text()
@@ -300,10 +302,11 @@ async def run_once(
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Connection": "close"}
     timeout = aiohttp.ClientTimeout(total=None)
     connector = aiohttp.TCPConnector(
+        family=socket.AF_INET,            # ✅ IPv4 강제 (Streamlit에서 중요)
         limit=concurrency,
-        limit_per_host=concurrency,
+        limit_per_host=1,                 # ✅ 단건이면 1로 고정해도 됨
         ttl_dns_cache=300,
-        keepalive_timeout=5,
+        force_close=True,                 # ✅ keep-alive 끊김 이슈 회피
         enable_cleanup_closed=True,
     )
 
