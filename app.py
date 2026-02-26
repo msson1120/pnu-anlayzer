@@ -308,8 +308,7 @@ async def run_once(
     connector = aiohttp.TCPConnector(
         limit=concurrency,
         limit_per_host=concurrency,
-        ttl_dns_cache=300,
-        keepalive_timeout=5,
+        force_close=True,          # 핵심: keep-alive 끔
         enable_cleanup_closed=True,
     )
 
@@ -320,6 +319,7 @@ async def run_once(
         total = len(pnu_list)
 
         async def one(i: int, p: str):
+            await asyncio.sleep(random.uniform(0.0, 0.3))
             r = await fetch_one(session, p, key, sem)
             return i, r
 
